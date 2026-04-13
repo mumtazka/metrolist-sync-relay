@@ -1,34 +1,56 @@
 /**
  * Metrolist Sync Relay Server (Node.js)
- * 
+ *
  * A lightweight WebSocket server that pairs devices by Google Account hash
  * and relays playback commands between them.
- * 
- * Deploy for free on Back4App, Glitch.com, etc.
+ *
+ * Security hardening:
+ *  - Max message size: 64 KB (DoS prevention)
+ *  - /stats protected by X-Admin-Key header
+ *  - account_hash validated as SHA-256 hex (64 chars)
+ *  - device_id sanitised (alphanumeric + dash/underscore, ≤128 chars)
+ *  - device_name clamped to 64 chars
+ *  - Max 512 concurrent connections
  */
 
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8080;
+const ADMIN_KEY = process.env.RELAY_ADMIN_KEY || "";
+const MAX_MESSAGE_BYTES = 65536;   // 64 KB
+const MAX_CONNECTIONS = 512;
 
-// ============================================================
-// Room Manager — tracks all connected devices grouped by account
-// ============================================================
+// ── Validation helpers ────────────────────────────────────────────────────────
+
+const ACCOUNT_HASH_RE = /^[0-9a-f]{64}$/;
+const DEVICE_ID_RE = /^[A-Za-z0-9\-_]{1,128}$/;
+
+function isValidAccountHash(h) { return typeof h === "string" && ACCOUNT_HASH_RE.test(h); }
+function isValidDeviceId(id) { return typeof id === "string" && DEVICE_ID_RE.test(id); }
+function sanitizeName(n) { return (typeof n === "string" ? n : "unknown").slice(0, 64); }
+
+// ── Room Manager ──────────────────────────────────────────────────────────────
 
 const rooms = new Map(); // accountHash -> Map<deviceId, device>
+let totalConnections = 0;
 
 function addDevice(device) {
     if (!rooms.has(device.accountHash)) {
         rooms.set(device.accountHash, new Map());
     }
-    rooms.get(device.accountHash).set(device.deviceId, device);
+    const room = rooms.get(device.accountHash);
+    // Remove stale session with same deviceId
+    if (room.has(device.deviceId)) totalConnections--;
+    room.set(device.deviceId, device);
+    totalConnections++;
 }
 
 function removeDevice(accountHash, deviceId) {
     const room = rooms.get(accountHash);
-    if (room) {
+    if (room && room.has(deviceId)) {
         room.delete(deviceId);
+        totalConnections--;
         if (room.size === 0) rooms.delete(accountHash);
     }
 }
@@ -57,9 +79,7 @@ function updateDeviceState(accountHash, deviceId, state) {
     }
 }
 
-// ============================================================
-// Message Types (must match client SyncProtocol.kt)
-// ============================================================
+// ── Message types ─────────────────────────────────────────────────────────────
 
 const MSG = {
     REGISTER: "register",
@@ -74,13 +94,11 @@ const MSG = {
     ROOM_INFO: "room_info",
 };
 
-// ============================================================
-// Helper: send a typed message over WebSocket
-// ============================================================
+// ── Helper: send a typed message safely ──────────────────────────────────────
 
 function sendMsg(ws, type, payload) {
     try {
-        if (ws.readyState === 1) {
+        if (ws.readyState === 1 /* OPEN */) {
             ws.send(JSON.stringify({ type, payload: JSON.stringify(payload) }));
         }
     } catch (e) {
@@ -88,48 +106,82 @@ function sendMsg(ws, type, payload) {
     }
 }
 
-// ============================================================
-// HTTP Server (health check + stats)
-// ============================================================
+// ── HTTP Server (health check + stats) ────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
     if (req.url === "/stats") {
-        let totalDevices = 0;
-        rooms.forEach((room) => (totalDevices += room.size));
+        // Protect stats with admin key when configured
+        if (ADMIN_KEY) {
+            const provided = req.headers["x-admin-key"] || "";
+            if (provided !== ADMIN_KEY) {
+                res.writeHead(401, { "Content-Type": "text/plain" });
+                res.end("Unauthorized");
+                return;
+            }
+        }
         res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end(`Rooms: ${rooms.size}, Devices: ${totalDevices}`);
+        res.end(`Rooms: ${rooms.size}, Devices: ${totalConnections}`);
     } else {
         res.writeHead(200, { "Content-Type": "text/plain" });
         res.end("Metrolist Sync Relay Server is running");
     }
 });
 
-// ============================================================
-// WebSocket Server
-// ============================================================
+// ── WebSocket Server ──────────────────────────────────────────────────────────
 
-const wss = new WebSocketServer({ server, path: "/sync" });
+const wss = new WebSocketServer({ server, path: "/sync", maxPayload: MAX_MESSAGE_BYTES });
 
 wss.on("connection", (ws) => {
+    // Enforce connection limit
+    if (totalConnections >= MAX_CONNECTIONS) {
+        ws.close(1013, "Server at capacity");
+        return;
+    }
+
     let currentDevice = null;
 
     ws.on("message", (raw) => {
         try {
+            // Re-check size (belt-and-suspenders; maxPayload handles this too)
+            if (raw.length > MAX_MESSAGE_BYTES) {
+                ws.close(1009, "Payload too large");
+                return;
+            }
+
             const message = JSON.parse(raw.toString());
-            const payload = message.payload ? JSON.parse(message.payload) : {};
+            if (!message || typeof message.type !== "string") return;
+
+            // Only parse inner payload when present
+            let payload = {};
+            if (message.payload && typeof message.payload === "string") {
+                payload = JSON.parse(message.payload);
+            }
 
             switch (message.type) {
-                // --- REGISTER: Device comes online ---
+                // --- REGISTER ---
                 case MSG.REGISTER: {
+                    const accountHash = payload.account_hash;
+                    const deviceId = payload.device_id;
+                    const deviceName = sanitizeName(payload.device_name);
+
+                    if (!isValidAccountHash(accountHash)) {
+                        ws.close(1008, "Invalid account_hash");
+                        return;
+                    }
+                    if (!isValidDeviceId(deviceId)) {
+                        ws.close(1008, "Invalid device_id");
+                        return;
+                    }
+
                     currentDevice = {
-                        deviceId: payload.device_id,
-                        deviceName: payload.device_name,
-                        accountHash: payload.account_hash,
+                        deviceId,
+                        deviceName,
+                        accountHash,
                         ws,
                         state: {
-                            device_id: payload.device_id,
-                            device_name: payload.device_name,
-                            account_hash: payload.account_hash,
+                            device_id: deviceId,
+                            device_name: deviceName,
+                            account_hash: accountHash,
                             song_id: null,
                             song_title: null,
                             song_artist: null,
@@ -140,24 +192,15 @@ wss.on("connection", (ws) => {
                     };
                     addDevice(currentDevice);
 
-                    console.log(
-                        `[REGISTER] ${payload.device_name} (${payload.device_id}) joined room ${payload.account_hash}`
-                    );
+                    console.log(`[REGISTER] ${deviceName} (${deviceId.slice(0, 8)}…) joined room ${accountHash.slice(0, 8)}…`);
 
-                    // Notify other devices
-                    const others = getOtherDevices(
-                        payload.account_hash,
-                        payload.device_id
-                    );
-                    others.forEach((other) => {
-                        sendMsg(other.ws, MSG.DEVICE_JOINED, currentDevice.state);
-                    });
+                    // Notify other devices in the room
+                    const others = getOtherDevices(accountHash, deviceId);
+                    others.forEach((other) => sendMsg(other.ws, MSG.DEVICE_JOINED, currentDevice.state));
 
-                    // Send room info to the new device
-                    const roomDevices = getRoomDevices(payload.account_hash).map(
-                        (d) => d.state
-                    );
-                    const active = getActiveDevice(payload.account_hash);
+                    // Send room info back to the new device
+                    const roomDevices = getRoomDevices(accountHash).map((d) => d.state);
+                    const active = getActiveDevice(accountHash);
                     sendMsg(ws, MSG.ROOM_INFO, {
                         devices: roomDevices,
                         active_device_id: active ? active.deviceId : null,
@@ -165,24 +208,16 @@ wss.on("connection", (ws) => {
                     break;
                 }
 
-                // --- STATE_UPDATE: Playback state changed ---
+                // --- STATE_UPDATE ---
                 case MSG.STATE_UPDATE: {
                     if (!currentDevice) break;
 
-                    updateDeviceState(
-                        currentDevice.accountHash,
-                        currentDevice.deviceId,
-                        payload
-                    );
+                    updateDeviceState(currentDevice.accountHash, currentDevice.deviceId, payload);
 
-                    // Check for conflict
-                    const otherPlaying = getOtherDevices(
-                        currentDevice.accountHash,
-                        currentDevice.deviceId
-                    ).filter((d) => d.state.is_playing);
+                    const otherPlaying = getOtherDevices(currentDevice.accountHash, currentDevice.deviceId)
+                        .filter((d) => d.state.is_playing);
 
                     if (payload.is_playing && otherPlaying.length > 0) {
-                        // Conflict! Another device is also playing
                         const otherDev = otherPlaying[0];
                         sendMsg(ws, MSG.CONFLICT, {
                             other_device_id: otherDev.deviceId,
@@ -191,37 +226,22 @@ wss.on("connection", (ws) => {
                             other_song_title: otherDev.state.song_title,
                         });
                     } else {
-                        // No conflict: broadcast to others
-                        const others = getOtherDevices(
-                            currentDevice.accountHash,
-                            currentDevice.deviceId
-                        );
-                        others.forEach((other) => {
-                            sendMsg(other.ws, MSG.REMOTE_STATE, payload);
-                        });
+                        getOtherDevices(currentDevice.accountHash, currentDevice.deviceId)
+                            .forEach((other) => sendMsg(other.ws, MSG.REMOTE_STATE, payload));
                     }
                     break;
                 }
 
-                // --- PLAYBACK_COMMAND: Remote control ---
+                // --- PLAYBACK_COMMAND ---
                 case MSG.PLAYBACK_COMMAND: {
                     if (!currentDevice) break;
-
-                    const others = getOtherDevices(
-                        currentDevice.accountHash,
-                        currentDevice.deviceId
-                    );
-                    others.forEach((other) => {
-                        sendMsg(other.ws, MSG.REMOTE_COMMAND, payload);
-                    });
-
-                    console.log(
-                        `[CMD] ${currentDevice.deviceName} sent command to ${others.length} device(s)`
-                    );
+                    const targets = getOtherDevices(currentDevice.accountHash, currentDevice.deviceId);
+                    targets.forEach((other) => sendMsg(other.ws, MSG.REMOTE_COMMAND, payload));
+                    console.log(`[CMD] ${currentDevice.deviceName} → ${targets.length} device(s): ${payload.action || "?"}`);
                     break;
                 }
 
-                // --- UNREGISTER: Graceful disconnect ---
+                // --- UNREGISTER ---
                 case MSG.UNREGISTER: {
                     if (currentDevice) {
                         handleDisconnect(currentDevice);
@@ -231,7 +251,8 @@ wss.on("connection", (ws) => {
                 }
             }
         } catch (e) {
-            console.error("[ERROR]", e.message);
+            // Never crash the server on bad input
+            console.error("[MSG ERROR]", e.message);
         }
     });
 
@@ -242,30 +263,20 @@ wss.on("connection", (ws) => {
         }
     });
 
-    ws.on("error", (e) => {
-        console.error("[WS ERROR]", e.message);
-    });
+    ws.on("error", (e) => console.error("[WS ERROR]", e.message));
 });
 
 function handleDisconnect(device) {
     removeDevice(device.accountHash, device.deviceId);
-    console.log(
-        `[DISCONNECT] ${device.deviceName} (${device.deviceId}) left room ${device.accountHash}`
-    );
-
-    // Notify remaining devices
-    const others = getRoomDevices(device.accountHash);
-    others.forEach((other) => {
-        sendMsg(other.ws, MSG.DEVICE_LEFT, device.state);
-    });
+    console.log(`[DISCONNECT] ${device.deviceName} (${device.deviceId.slice(0, 8)}…)`);
+    getRoomDevices(device.accountHash)
+        .forEach((other) => sendMsg(other.ws, MSG.DEVICE_LEFT, device.state));
 }
 
-// ============================================================
-// Start
-// ============================================================
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Metrolist Sync Relay Server running on port ${PORT}`);
-    console.log(`WebSocket endpoint: ws://0.0.0.0:${PORT}/sync`);
-    console.log(`Health check: http://0.0.0.0:${PORT}/`);
+    console.log(`Metrolist Sync Relay running on port ${PORT}`);
+    console.log(`WebSocket: ws://0.0.0.0:${PORT}/sync`);
+    console.log(`Stats endpoint protected: ${ADMIN_KEY ? "yes (X-Admin-Key required)" : "no (set RELAY_ADMIN_KEY env var)"}`);
 });
